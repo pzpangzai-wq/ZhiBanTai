@@ -257,6 +257,11 @@ namespace Win7CuteLanMonitor
                     MessageBox.Show(text, "局域网扫描完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
             }
+            catch (Exception ex)
+            {
+                CrashLog.Write(ex);
+                _summary.Text = "局域网扫描超时或失败。可以先使用已记住的电脑，稍后再点“扫描”重试。";
+            }
             finally
             {
                 _discoverButton.Enabled = true;
@@ -1095,37 +1100,68 @@ namespace Win7CuteLanMonitor
 
     internal static class LanDiscovery
     {
+        private const int MaxScanDurationMs = 25000;
+        private const int MaxParallelProbes = 32;
+        private const int ReverseDnsTimeoutMs = 500;
+
         public static async Task<List<LanDevice>> FindAsync(int timeoutMs)
         {
             List<IPAddress> addresses = GetCandidateAddresses();
             if (addresses.Count == 0) return new List<LanDevice>();
 
-            var tasks = addresses.Select(async ip =>
-            {
-                bool alive = await NetworkProbe.IsOnlineAsync(ip.ToString(), timeoutMs);
-                if (!alive) return null;
+            SemaphoreSlim gate = new SemaphoreSlim(MaxParallelProbes);
+            List<Task<LanDevice>> tasks = addresses
+                .Select(ip => ProbeAddressAsync(ip, timeoutMs, gate))
+                .ToList();
 
-                string host = TryResolveHost(ip);
-                string target = string.IsNullOrWhiteSpace(host) ? ip.ToString() : host;
-                bool printer = await NetworkProbe.HasPrinterPortAsync(ip.ToString(), 550) || LooksLikePrinter(target);
-                return new LanDevice
-                {
-                    Host = target,
-                    Ip = ip.ToString(),
-                    DisplayName = target,
-                    OsName = printer ? "" : await OsDetector.GetRemoteOsNameAsync(target, 1100),
-                    DeviceKind = printer ? DeviceKind.Printer : DeviceKind.Computer,
-                    Online = true
-                };
-            }).ToArray();
+            Task<LanDevice[]> all = Task.WhenAll(tasks);
+            Task finished = await Task.WhenAny(all, Task.Delay(MaxScanDurationMs));
+            IEnumerable<LanDevice> found = finished == all
+                ? all.Result
+                : tasks
+                    .Where(t => t.IsCompleted && !t.IsFaulted && !t.IsCanceled)
+                    .Select(t => t.Result);
 
-            LanDevice[] found = await Task.WhenAll(tasks);
             return found
                 .Where(d => d != null)
                 .GroupBy(d => d.Host, StringComparer.OrdinalIgnoreCase)
                 .Select(g => g.First())
                 .OrderBy(d => d.Host)
                 .ToList();
+        }
+
+        private static async Task<LanDevice> ProbeAddressAsync(IPAddress ip, int timeoutMs, SemaphoreSlim gate)
+        {
+            await gate.WaitAsync();
+            try
+            {
+                string ipText = ip.ToString();
+                bool alive = await NetworkProbe.IsOnlineAsync(ipText, timeoutMs);
+                if (!alive) return null;
+
+                string host = await TryResolveHostAsync(ip, ReverseDnsTimeoutMs);
+                string target = string.IsNullOrWhiteSpace(host) ? ipText : host;
+                bool printer = await NetworkProbe.HasPrinterPortAsync(ipText, 550) || LooksLikePrinter(target);
+                string osName = printer ? "" : await OsDetector.GetRemoteOsNameAsync(target, 1100);
+
+                return new LanDevice
+                {
+                    Host = target,
+                    Ip = ipText,
+                    DisplayName = target,
+                    OsName = osName,
+                    DeviceKind = printer ? DeviceKind.Printer : DeviceKind.Computer,
+                    Online = true
+                };
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                gate.Release();
+            }
         }
 
         private static bool LooksLikePrinter(string text)
@@ -1226,6 +1262,15 @@ namespace Win7CuteLanMonitor
             }
             catch { }
             return null;
+        }
+
+        private static async Task<string> TryResolveHostAsync(IPAddress ip, int timeoutMs)
+        {
+            Task<string> resolve = Task.Factory.StartNew(() => TryResolveHost(ip));
+            Task winner = await Task.WhenAny(resolve, Task.Delay(timeoutMs));
+            if (winner != resolve) return null;
+            try { return resolve.Result; }
+            catch { return null; }
         }
     }
 
