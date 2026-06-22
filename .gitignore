@@ -1,0 +1,22 @@
+# Local runtime data
+电脑配置.txt
+电脑清单.txt
+程序设置.txt
+错误日志.txt
+
+# Build outputs
+*.exe
+*.pdb
+*.obj
+*.user
+bin/
+obj/
+
+# Locally generated archives
+*.zip
+
+# OS/editor noise
+Thumbs.db
+.DS_Store
+.vs/
+.vscode/
