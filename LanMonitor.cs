@@ -921,12 +921,34 @@ namespace Win7CuteLanMonitor
             if (string.IsNullOrWhiteSpace(host)) return false;
             Task<bool>[] tasks =
             {
+                IsComputerLikeAsync(host, timeoutMs),
+                HasPrinterPortAsync(host, timeoutMs)
+            };
+
+            bool[] results = await Task.WhenAll(tasks);
+            return results.Any(x => x);
+        }
+
+        public static async Task<bool> IsComputerLikeAsync(string host, int timeoutMs)
+        {
+            if (string.IsNullOrWhiteSpace(host)) return false;
+            Task<bool>[] tasks =
+            {
                 PingAsync(host, timeoutMs),
+                HasComputerServiceAsync(host, timeoutMs)
+            };
+
+            bool[] results = await Task.WhenAll(tasks);
+            return results.Any(x => x);
+        }
+
+        public static async Task<bool> HasComputerServiceAsync(string host, int timeoutMs)
+        {
+            if (string.IsNullOrWhiteSpace(host)) return false;
+            Task<bool>[] tasks =
+            {
                 TcpAsync(host, 445, timeoutMs),
-                TcpAsync(host, 139, timeoutMs),
-                TcpAsync(host, 9100, timeoutMs),
-                TcpAsync(host, 515, timeoutMs),
-                TcpAsync(host, 631, timeoutMs)
+                TcpAsync(host, 139, timeoutMs)
             };
 
             bool[] results = await Task.WhenAll(tasks);
@@ -1102,7 +1124,7 @@ namespace Win7CuteLanMonitor
     {
         private const int MaxScanDurationMs = 25000;
         private const int MaxParallelProbes = 32;
-        private const int ReverseDnsTimeoutMs = 500;
+        private const int ReverseDnsTimeoutMs = 1200;
 
         public static async Task<List<LanDevice>> FindAsync(int timeoutMs)
         {
@@ -1110,15 +1132,27 @@ namespace Win7CuteLanMonitor
             if (addresses.Count == 0) return new List<LanDevice>();
 
             SemaphoreSlim gate = new SemaphoreSlim(MaxParallelProbes);
-            List<Task<LanDevice>> tasks = addresses
-                .Select(ip => ProbeAddressAsync(ip, timeoutMs, gate))
+            List<Task> touchTasks = addresses
+                .Select(ip => TouchAddressAsync(ip, timeoutMs, gate))
                 .ToList();
 
-            Task<LanDevice[]> all = Task.WhenAll(tasks);
-            Task finished = await Task.WhenAny(all, Task.Delay(MaxScanDurationMs));
+            await Task.WhenAny(Task.WhenAll(touchTasks), Task.Delay(Math.Min(MaxScanDurationMs, 9000)));
+
+            HashSet<string> candidateIps = new HashSet<string>(addresses.Select(ip => ip.ToString()), StringComparer.OrdinalIgnoreCase);
+            List<IPAddress> reliableAddresses = GetReliableArpAddresses()
+                .Where(ip => candidateIps.Contains(ip))
+                .Select(ip => IPAddress.Parse(ip))
+                .ToList();
+
+            List<Task<LanDevice>> deviceTasks = reliableAddresses
+                .Select(ip => BuildDeviceAsync(ip, timeoutMs))
+                .ToList();
+
+            Task<LanDevice[]> all = Task.WhenAll(deviceTasks);
+            Task finished = await Task.WhenAny(all, Task.Delay(Math.Max(1000, MaxScanDurationMs - 9000)));
             IEnumerable<LanDevice> found = finished == all
                 ? all.Result
-                : tasks
+                : deviceTasks
                     .Where(t => t.IsCompleted && !t.IsFaulted && !t.IsCanceled)
                     .Select(t => t.Result);
 
@@ -1130,18 +1164,35 @@ namespace Win7CuteLanMonitor
                 .ToList();
         }
 
-        private static async Task<LanDevice> ProbeAddressAsync(IPAddress ip, int timeoutMs, SemaphoreSlim gate)
+        private static async Task TouchAddressAsync(IPAddress ip, int timeoutMs, SemaphoreSlim gate)
         {
             await gate.WaitAsync();
             try
             {
                 string ipText = ip.ToString();
-                bool alive = await NetworkProbe.IsOnlineAsync(ipText, timeoutMs);
-                if (!alive) return null;
+                await NetworkProbe.IsOnlineAsync(ipText, Math.Min(timeoutMs, 450));
+            }
+            catch { }
+            finally
+            {
+                gate.Release();
+            }
+        }
 
+        private static async Task<LanDevice> BuildDeviceAsync(IPAddress ip, int timeoutMs)
+        {
+            try
+            {
+                string ipText = ip.ToString();
                 string host = await TryResolveHostAsync(ip, ReverseDnsTimeoutMs);
                 string target = string.IsNullOrWhiteSpace(host) ? ipText : host;
-                bool printer = await NetworkProbe.HasPrinterPortAsync(ipText, 550) || LooksLikePrinter(target);
+                Task<bool> computerTask = NetworkProbe.HasComputerServiceAsync(ipText, Math.Min(timeoutMs, 650));
+                Task<bool> printerPortTask = NetworkProbe.HasPrinterPortAsync(ipText, 550);
+                await Task.WhenAll(computerTask, printerPortTask);
+
+                bool computer = computerTask.Result;
+                bool printerPort = printerPortTask.Result;
+                bool printer = printerPort && (LooksLikePrinter(target) || !computer);
                 string osName = printer ? "" : await OsDetector.GetRemoteOsNameAsync(target, 1100);
 
                 return new LanDevice
@@ -1158,10 +1209,6 @@ namespace Win7CuteLanMonitor
             {
                 return null;
             }
-            finally
-            {
-                gate.Release();
-            }
         }
 
         private static bool LooksLikePrinter(string text)
@@ -1173,33 +1220,63 @@ namespace Win7CuteLanMonitor
 
         private static List<IPAddress> GetCandidateAddresses()
         {
-            List<IPAddress> result = new List<IPAddress>();
+            List<IPAddress> preferred = new List<IPAddress>();
+            List<IPAddress> fallback = new List<IPAddress>();
+            HashSet<string> localAddresses = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             foreach (NetworkInterface nic in NetworkInterface.GetAllNetworkInterfaces())
             {
                 if (nic.OperationalStatus != OperationalStatus.Up) continue;
                 if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                if (nic.NetworkInterfaceType == NetworkInterfaceType.Tunnel) continue;
 
                 IPInterfaceProperties props;
                 try { props = nic.GetIPProperties(); }
                 catch { continue; }
 
+                bool preferredNic = HasUsableIpv4Gateway(props);
                 foreach (UnicastIPAddressInformation uni in props.UnicastAddresses)
                 {
                     if (uni.Address.AddressFamily != AddressFamily.InterNetwork) continue;
                     byte[] ip = uni.Address.GetAddressBytes();
                     byte[] mask = uni.IPv4Mask == null ? null : uni.IPv4Mask.GetAddressBytes();
                     if (mask == null) continue;
-                    AddSubnet(result, ip, mask);
+                    if (!IsUsableLanIPv4(ip)) continue;
+
+                    localAddresses.Add(uni.Address.ToString());
+                    AddSubnet(preferredNic ? preferred : fallback, ip, mask);
                 }
             }
 
-            string local = GetLocalIPv4();
+            List<IPAddress> result = preferred.Count > 0 ? preferred : fallback;
             return result
-                .Where(ip => ip.ToString() != local)
+                .Where(ip => !localAddresses.Contains(ip.ToString()))
                 .GroupBy(ip => ip.ToString())
                 .Select(g => g.First())
                 .Take(254)
                 .ToList();
+        }
+
+        private static bool HasUsableIpv4Gateway(IPInterfaceProperties props)
+        {
+            try
+            {
+                return props.GatewayAddresses.Any(g =>
+                    g != null &&
+                    g.Address != null &&
+                    g.Address.AddressFamily == AddressFamily.InterNetwork &&
+                    IsUsableLanIPv4(g.Address.GetAddressBytes()));
+            }
+            catch { return false; }
+        }
+
+        private static bool IsUsableLanIPv4(byte[] ip)
+        {
+            if (ip == null || ip.Length != 4) return false;
+            if (ip[0] == 10) return true;
+            if (ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) return true;
+            if (ip[0] == 192 && ip[1] == 168) return true;
+            return false;
         }
 
         private static void AddSubnet(List<IPAddress> result, byte[] ip, byte[] mask)
@@ -1266,11 +1343,170 @@ namespace Win7CuteLanMonitor
 
         private static async Task<string> TryResolveHostAsync(IPAddress ip, int timeoutMs)
         {
-            Task<string> resolve = Task.Factory.StartNew(() => TryResolveHost(ip));
-            Task winner = await Task.WhenAny(resolve, Task.Delay(timeoutMs));
-            if (winner != resolve) return null;
-            try { return resolve.Result; }
-            catch { return null; }
+            List<Task<string>> resolvers = new List<Task<string>>
+            {
+                Task.Factory.StartNew(() => TryResolveHost(ip)),
+                Task.Factory.StartNew(() => TryResolveNetBiosName(ip, timeoutMs))
+            };
+            Task timeout = Task.Delay(timeoutMs);
+
+            while (resolvers.Count > 0)
+            {
+                Task winner = await Task.WhenAny(resolvers.Cast<Task>().Concat(new[] { timeout }));
+                if (winner == timeout) return null;
+
+                Task<string> resolved = (Task<string>)winner;
+                resolvers.Remove(resolved);
+                try
+                {
+                    if (!string.IsNullOrWhiteSpace(resolved.Result)) return resolved.Result;
+                }
+                catch { }
+            }
+
+            return null;
+        }
+
+        private static bool HasReliableArpEntry(string ipText)
+        {
+            string mac;
+            return TryGetArpMac(ipText, out mac);
+        }
+
+        private static HashSet<string> GetReliableArpAddresses()
+        {
+            HashSet<string> result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                using (Process process = new Process())
+                {
+                    process.StartInfo = new ProcessStartInfo
+                    {
+                        FileName = Path.Combine(Environment.SystemDirectory, "arp.exe"),
+                        Arguments = "-a",
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true
+                    };
+                    process.Start();
+                    if (!process.WaitForExit(1200))
+                    {
+                        try { process.Kill(); }
+                        catch { }
+                        return result;
+                    }
+
+                    string output = process.StandardOutput.ReadToEnd();
+                    foreach (string line in Regex.Split(output ?? "", "\r?\n"))
+                    {
+                        string ipText;
+                        string mac;
+                        if (TryParseReliableArpLine(line, out ipText, out mac)) result.Add(ipText);
+                    }
+                }
+            }
+            catch { }
+            return result;
+        }
+
+        private static bool TryGetArpMac(string ipText, out string mac)
+        {
+            mac = null;
+            try
+            {
+                using (Process process = new Process())
+                {
+                    process.StartInfo = new ProcessStartInfo
+                    {
+                        FileName = Path.Combine(Environment.SystemDirectory, "arp.exe"),
+                        Arguments = "-a " + ipText,
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true
+                    };
+                    process.Start();
+                    if (!process.WaitForExit(650))
+                    {
+                        try { process.Kill(); }
+                        catch { }
+                        return false;
+                    }
+
+                    string output = process.StandardOutput.ReadToEnd();
+                    foreach (string line in Regex.Split(output ?? "", "\r?\n"))
+                    {
+                        string foundIp;
+                        string foundMac;
+                        if (TryParseReliableArpLine(line, out foundIp, out foundMac) && string.Equals(foundIp, ipText, StringComparison.OrdinalIgnoreCase))
+                        {
+                            mac = foundMac;
+                            return true;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private static bool TryParseReliableArpLine(string line, out string ipText, out string mac)
+        {
+            ipText = null;
+            mac = null;
+            Match match = Regex.Match(line ?? "", @"^\s*((?:\d{1,3}\.){3}\d{1,3})\s+([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})(?:\s+\S+)?\s*$");
+            if (!match.Success) return false;
+
+            string value = match.Groups[2].Value.ToLowerInvariant();
+            if (value == "00-00-00-00-00-00") return false;
+            if (value == "ff-ff-ff-ff-ff-ff") return false;
+
+            ipText = match.Groups[1].Value;
+            mac = value;
+            return true;
+        }
+
+        private static string TryResolveNetBiosName(IPAddress ip, int timeoutMs)
+        {
+            try
+            {
+                using (Process process = new Process())
+                {
+                    process.StartInfo = new ProcessStartInfo
+                    {
+                        FileName = Path.Combine(Environment.SystemDirectory, "nbtstat.exe"),
+                        Arguments = "-A " + ip,
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true
+                    };
+                    process.Start();
+                    if (!process.WaitForExit(timeoutMs))
+                    {
+                        try { process.Kill(); }
+                        catch { }
+                        return null;
+                    }
+
+                    string output = process.StandardOutput.ReadToEnd();
+                    foreach (string line in Regex.Split(output ?? "", "\r?\n"))
+                    {
+                        Match match = Regex.Match(line, @"^\s*([A-Za-z0-9][A-Za-z0-9_-]{0,14})\s+<00>\s+");
+                        if (!match.Success) continue;
+                        if (line.IndexOf("GROUP", StringComparison.OrdinalIgnoreCase) >= 0 || line.IndexOf("组", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+
+                        string name = match.Groups[1].Value.Trim();
+                        if (string.Equals(name, "WORKGROUP", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (string.Equals(name, "MSHOME", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (string.Equals(name, "__MSBROWSE__", StringComparison.OrdinalIgnoreCase)) continue;
+                        return name;
+                    }
+                }
+            }
+            catch { }
+            return null;
         }
     }
 
