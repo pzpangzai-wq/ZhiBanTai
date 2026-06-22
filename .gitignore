@@ -14,6 +14,7 @@ obj/
 
 # Locally generated archives
 *.zip
+_release/
 
 # OS/editor noise
 Thumbs.db
